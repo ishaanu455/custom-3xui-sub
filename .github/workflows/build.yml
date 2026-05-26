@@ -1,0 +1,211 @@
+name: Build Custom 3x-ui
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: '3x-ui version tag (e.g. v3.1.0). Empty = latest.'
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - 'web/assets/css/premium.css'
+      - 'web/assets/js/subscription.js'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout YOUR repo ────────────────────────────────
+      - name: Checkout my repo
+        uses: actions/checkout@v4
+        with:
+          path: my-sub
+
+      # ── 2. Get 3x-ui version ─────────────────────────────────
+      - name: Get 3x-ui version
+        id: ver
+        run: |
+          INPUT="${{ github.event.inputs.target_version }}"
+          if [[ -n "$INPUT" ]]; then
+            TAG="$INPUT"
+          else
+            TAG=$(curl -sL https://api.github.com/repos/MHSanaei/3x-ui/releases/latest \
+                  | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          fi
+          VER="${TAG#v}"
+          echo "tag=$TAG"     >> $GITHUB_OUTPUT
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "Building 3x-ui $TAG"
+
+      # ── 3. Checkout 3x-ui source ─────────────────────────────
+      - name: Checkout 3x-ui ${{ steps.ver.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: MHSanaei/3x-ui
+          ref: ${{ steps.ver.outputs.tag }}
+          path: 3x-ui
+
+      # ── 4. Setup tools ───────────────────────────────────────
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # ── 5. Patch frontend/subpage.html ───────────────────────
+      #
+      #  v3 sub server does NOT use Go templates (no {{ .base_path }}).
+      #  It does a plain string replace:
+      #    src="/assets/  →  src="<basePath>assets/
+      #    href="/assets/ →  href="<basePath>assets/
+      #
+      #  So CSS/JS links MUST use /assets/... prefix.
+      #
+      - name: Patch subpage.html
+        run: |
+          python3 << 'PYEOF'
+          import re
+
+          path = '3x-ui/frontend/subpage.html'
+          with open(path, 'r') as f:
+              html = f.read()
+
+          print(f"Before patch ({len(html)} chars):\n{html}\n")
+
+          # Remove stock React/Vite module tags (they 404 after our patch)
+          html = re.sub(
+              r'<script\s+type="module"[^>]*src="[^"]*subpage[^"]*"[^>]*>\s*</script>\s*',
+              '', html)
+          html = re.sub(r'<link\s+rel="modulepreload"[^>]*>\s*', '', html)
+          html = re.sub(r'<link\s+rel="stylesheet"\s+crossorigin[^>]*>\s*', '', html)
+
+          # Inject our CSS just before </head>
+          # Use /assets/ prefix — Go will rewrite to <basePath>assets/ at runtime
+          css_tag = '  <link rel="stylesheet" href="/assets/css/premium.css">\n</head>'
+          html = html.replace('</head>', css_tag, 1)
+
+          # Inject QRious + our JS just before </body>
+          js_tags = (
+              '  <script src="/assets/js/vendor/qrious.min.js"></script>\n'
+              '  <script>\n'
+              '    document.addEventListener("DOMContentLoaded", function() {\n'
+              '      document.body.classList.add("premium-theme");\n'
+              '      var app = document.getElementById("app");\n'
+              '      if (app) { app.style.display = "none"; }\n'
+              '    });\n'
+              '  </script>\n'
+              '  <script src="/assets/js/subscription.js"></script>\n'
+              '</body>'
+          )
+          html = html.replace('</body>', js_tags, 1)
+
+          with open(path, 'w') as f:
+              f.write(html)
+
+          print(f"After patch ({len(html)} chars):\n{html}\n")
+          print("✅ subpage.html patched successfully")
+          PYEOF
+
+      # ── 6. Build Vite frontend ───────────────────────────────
+      - name: Build Vite frontend
+        working-directory: 3x-ui/frontend
+        run: |
+          npm ci
+          npm run build
+          echo "=== Built files in web/dist/ ==="
+          ls -la ../web/dist/
+
+      # ── 7. Copy CSS/JS into dist/assets ─────────────────────
+      #
+      #  IMPORTANT: Must happen AFTER npm build because
+      #  vite build uses emptyOutDir:true (clears web/dist/)
+      #
+      - name: Copy custom CSS/JS into dist/assets
+        run: |
+          mkdir -p 3x-ui/web/dist/assets/css
+          mkdir -p 3x-ui/web/dist/assets/js/vendor
+
+          cp my-sub/web/assets/css/premium.css \
+             3x-ui/web/dist/assets/css/premium.css
+
+          cp my-sub/web/assets/js/subscription.js \
+             3x-ui/web/dist/assets/js/subscription.js
+
+          # Download QRious (needed for QR code generation)
+          curl -sL \
+            "https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js" \
+            -o 3x-ui/web/dist/assets/js/vendor/qrious.min.js
+
+          echo "=== Assets in dist after copy ==="
+          ls -la 3x-ui/web/dist/assets/css/
+          ls -la 3x-ui/web/dist/assets/js/
+          ls -la 3x-ui/web/dist/assets/js/vendor/
+
+      # ── 8. Verify dist/subpage.html ──────────────────────────
+      - name: Verify dist
+        run: |
+          echo "=== dist/subpage.html ==="
+          cat 3x-ui/web/dist/subpage.html
+          echo ""
+          grep "premium.css" 3x-ui/web/dist/subpage.html \
+            && echo "✅ CSS link present" \
+            || (echo "❌ CSS link MISSING — build will be wrong" && exit 1)
+          grep "subscription.js" 3x-ui/web/dist/subpage.html \
+            && echo "✅ JS link present" \
+            || (echo "❌ JS link MISSING" && exit 1)
+
+      # ── 9. Build Go binaries ─────────────────────────────────
+      - name: Install ARM64 cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build Go binary AMD64
+        working-directory: 3x-ui
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -ldflags "-s -w" -o x-ui-linux-amd64 main.go
+          echo "AMD64 size: $(du -sh x-ui-linux-amd64 | cut -f1)"
+
+      - name: Build Go binary ARM64
+        working-directory: 3x-ui
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
+            go build -ldflags "-s -w" -o x-ui-linux-arm64 main.go
+          echo "ARM64 size: $(du -sh x-ui-linux-arm64 | cut -f1)"
+
+      # ── 10. Publish Release ──────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Custom 3x-ui v${{ steps.ver.outputs.version }}
+          make_latest: true
+          body: |
+            Custom 3x-ui binary with my subscription page.
+
+            **Base:** 3x-ui v${{ steps.ver.outputs.version }}
+
+            ### Install
+            ```bash
+            systemctl stop x-ui
+            cp /usr/local/x-ui/x-ui /usr/local/x-ui/x-ui.bak
+            # Download x-ui-linux-amd64 (or arm64) from assets below
+            cp x-ui-linux-amd64 /usr/local/x-ui/x-ui
+            chmod +x /usr/local/x-ui/x-ui
+            systemctl start x-ui
+            ```
+          files: |
+            3x-ui/x-ui-linux-amd64
+            3x-ui/x-ui-linux-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
